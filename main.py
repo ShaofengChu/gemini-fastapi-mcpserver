@@ -1,12 +1,46 @@
 import json
 import os
-from fastapi import FastAPI, HTTPException
+from datetime import datetime, timedelta, timezone
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import google.generativeai as genai
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 
 # 加载 .env 文件中的环境变量
 load_dotenv()
+
+# --- 认证相关配置 ---
+# 建议将 SECRET_KEY 存储在环境变量中，并且是一个复杂的随机字符串
+# 你可以在 shell 中用 `openssl rand -hex 32` 生成一个
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise ValueError("请设置 SECRET_KEY 环境变量用于 JWT 签名")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# 用于密码哈希
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# OAuth2PasswordBearer 会在 /token (我们即将创建的) URL 上寻找 token
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# --- 模拟用户数据库 ---
+# 在真实应用中，这里应该是数据库查询
+fake_users_db = {
+    "testuser": {
+        "username": "testuser",
+        "full_name": "Test User",
+        "email": "test@example.com",
+        # 密码应该是哈希过的，"password" 的哈希值是 "$2b$12$EixZA0C5T.VwORSo5g4NAeQuG2V.TjDaO/j2O.aLaaP2Yc/I2pYfS"
+        "hashed_password": pwd_context.hash("password"),
+        "disabled": False,
+    }
+}
 
 # 从环境变量中获取 Google API Key
 # 建议在部署时使用环境变量，而不是硬编码
@@ -18,6 +52,18 @@ if not api_key:
 genai.configure(api_key=api_key)
 
 app = FastAPI()
+
+# --- Pydantic 数据模型 ---
+class User(BaseModel):
+    username: str
+    email: str | None = None
+    full_name: str | None = None
+    disabled: bool | None = None
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
 
 # 定义请求数据模型，用于接收客户端的指令
 class CommandRequest(BaseModel):
@@ -47,9 +93,66 @@ model = genai.GenerativeModel(
     tools=[get_current_weather]
 )
 
+# --- 认证辅助函数 ---
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_user(db, username: str):
+    if username in db:
+        user_dict = db[username]
+        return User(**user_dict)
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_active_user(token: Annotated[str, Depends(oauth2_scheme)]):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = get_user(fake_users_db, username=username)
+    if user is None:
+        raise credentials_exception
+    if user.disabled:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    return user
+
+# --- 路由定义 ---
+
+# 登录路由，用于获取 JWT Token
+@app.post("/token", response_model=Token)
+async def login_for_access_token(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]):
+    user = get_user(fake_users_db, form_data.username)
+    if not user or not verify_password(form_data.password, fake_users_db[user.username]["hashed_password"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
 # 路由定义：处理客户端的 POST 请求
 @app.post("/command")
-async def process_command(request: CommandRequest):
+async def process_command(request: CommandRequest, current_user: Annotated[User, Depends(get_current_active_user)]):
     try:
         # Gemini 的工具调用通常在聊天会话中进行管理
         chat = model.start_chat()
